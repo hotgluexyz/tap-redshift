@@ -36,6 +36,7 @@ from singer.catalog import Catalog, CatalogEntry
 from singer.schema import Schema
 
 from tap_redshift import resolve
+import re
 
 __version__ = '1.0.0b9'
 
@@ -72,7 +73,7 @@ DATETIME_TYPES = {'timestamp', 'timestamptz',
 
 CONFIG = {}
 
-ROWS_PER_NETWORK_CALL = 40_000
+ROWS_PER_NETWORK_CALL = 1_000
 
 
 def table_spec_to_dict(table_spec):
@@ -94,8 +95,54 @@ def transform_db_schema_type(db_schemas):
         else:
             return f"('{db_schemas[0]}')"
 
+def get_columns_list(connection,query_string):
+    desired_columns = []
+    has_limit = re.search(r'\bLIMIT\s+\d+', query_string, re.IGNORECASE)
 
-def discover_catalog(conn, db_name, db_schemas):
+    if has_limit:
+        # Replace the existing LIMIT clause with LIMIT 0
+        query_string = re.sub(r'\bLIMIT\s+\d+', 'LIMIT 0', query_string, flags=re.IGNORECASE)
+    else:
+        # Append LIMIT 0 to the query. Do not execute the query only describe it
+        query_string = query_string + " LIMIT 0"
+    cols_result = describe_query(connection,query_string)
+    desired_columns = [desc[0] for desc in cols_result]
+    return desired_columns 
+
+def queries_catalog(conn,database_name,queries):
+    entries = []
+    for query in queries:
+        columns_list = get_columns_list(conn,query['query'])
+        query_name = query.get("name").replace(" ","-")
+        cols = []
+        column_schemas = {}
+        for column in columns_list:
+            #All query columns for now will be string and nullable type
+            column_schema_dict = {
+                "type":"varchar",
+                "nullable":"YES",
+            }
+            cols.append({
+                "name":column,
+                "type":"varchar",
+                "nullable":"YES",
+            })
+            column_schemas[column] =  schema_for_column(column_schema_dict)
+        schema = Schema(type='object',
+                properties=column_schemas)
+        metadata = create_column_metadata(
+            database_name, cols, False, query_name)
+        entry = CatalogEntry(
+            tap_stream_id=query_name,
+            stream=query_name,
+            schema=schema,
+            table="custom-query",
+            metadata= metadata,
+            database=database_name)
+        entries.append(entry)
+    return entries    
+
+def discover_catalog(conn, db_name, db_schemas,queries=None):
     '''Returns a Catalog describing the structure of the database.'''
     db_schemas = transform_db_schema_type(db_schemas)
     table_spec = select_all(
@@ -175,13 +222,16 @@ def discover_catalog(conn, db_name, db_schemas):
             database=db_name)
 
         entries.append(entry)
-
+    if queries:
+        queries_entries = queries_catalog(conn,db_name,queries)
+        if queries_entries:
+            entries += queries_entries
     return Catalog(entries)
 
 
-def do_discover(conn, db_name, db_schema):
+def do_discover(conn, db_name, db_schema,queries=None):
     LOGGER.info("Running discover")
-    discover_catalog(conn, db_name, db_schema).dump()
+    discover_catalog(conn, db_name, db_schema,queries).dump()
     LOGGER.info("Completed discover")
 
 
@@ -300,6 +350,13 @@ def select_all(conn, query):
     cur.close()
     return column_specs
 
+def describe_query(conn, query):
+    cur = conn.cursor()
+    cur.execute(query)
+    column_specs = cur.description
+    cur.close()
+    return column_specs
+
 
 def get_stream_version(tap_stream_id, state):
     return singer.get_bookmark(state,
@@ -307,12 +364,16 @@ def get_stream_version(tap_stream_id, state):
                                "version") or int(time.time() * 1000)
 
 
-def row_to_record(catalog_entry, version, row, columns, time_extracted):
+def row_to_record(catalog_entry, version, row, columns, time_extracted,query=None):
     row_to_persist = ()
     for idx, elem in enumerate(row):
         if isinstance(elem, datetime.datetime):
             elem = elem.isoformat('T') + 'Z'
-        row_to_persist += (elem,)
+        if not query:    
+            row_to_persist += (elem,)
+        else:
+            #Convert all query columns to string
+            row_to_persist += (str(elem),)
     return singer.RecordMessage(
         stream=catalog_entry.stream,
         record=dict(zip(columns, row_to_persist)),
@@ -320,7 +381,7 @@ def row_to_record(catalog_entry, version, row, columns, time_extracted):
         time_extracted=time_extracted)
 
 
-def sync_table(connection, catalog_entry, state):
+def sync_table(connection, catalog_entry, state,query=None):
     columns = list(catalog_entry.schema.properties.keys())
     start_date = CONFIG.get('start_date')
     formatted_start_date = None
@@ -334,13 +395,14 @@ def sync_table(connection, catalog_entry, state):
     tap_stream_id = catalog_entry.tap_stream_id
     LOGGER.info('Beginning sync for {} table'.format(tap_stream_id))
     with connection.cursor(f"redshift_cursor_{secrets.token_hex(8)}") as cursor:
-        schema, table = catalog_entry.table.split('.')
-        database = catalog_entry.database
-        select = 'SELECT {} FROM {}.{}.{}'.format(
-            ','.join('"{}"'.format(c) for c in columns),
-            '"{}"'.format(database),
-            '"{}"'.format(schema),
-            '"{}"'.format(table))
+        if not query:
+            schema, table = catalog_entry.table.split('.')
+            database = catalog_entry.database
+            select = 'SELECT {} FROM {}.{}.{}'.format(
+                ','.join('"{}"'.format(c) for c in columns),
+                '"{}"'.format(database),
+                '"{}"'.format(schema),
+                '"{}"'.format(table))
         params = {}
 
         if start_date is not None:
@@ -394,6 +456,9 @@ def sync_table(connection, catalog_entry, state):
             select += ' ORDER BY {} ASC'.format(replication_key)
 
         time_extracted = utils.now()
+        #Override select with query from the config. 
+        if query:
+            select = query.get("query")
         query_string = cursor.mogrify(select, params)
         LOGGER.info('Running {}'.format(query_string))
 
@@ -411,7 +476,9 @@ def sync_table(connection, catalog_entry, state):
                                                stream_version,
                                                row,
                                                columns,
-                                               time_extracted)
+                                               time_extracted,
+                                               query
+                                               )
                 yield record_message
 
                 if replication_key is not None:
@@ -431,9 +498,13 @@ def sync_table(connection, catalog_entry, state):
         yield singer.StateMessage(value=copy.deepcopy(state))
 
 
-def generate_messages(conn, db_name, db_schema, catalog, state):
-    catalog = resolve.resolve_catalog(discover_catalog(conn, db_name, db_schema),
+def generate_messages(conn, db_name, db_schema, catalog, state,query=None):
+    #We need to skip resolving query table
+    if not query:
+        catalog = resolve.resolve_catalog(discover_catalog(conn, db_name, db_schema),
                                       catalog, state)
+    else:
+        catalog = catalog    
 
     for catalog_entry in catalog.streams:
         state = singer.set_currently_syncing(state,
@@ -460,7 +531,7 @@ def generate_messages(conn, db_name, db_schema, catalog, state):
         with metrics.job_timer('sync_table') as timer:
             timer.tags['database'] = catalog_entry.database
             timer.tags['table'] = catalog_entry.table
-            for message in sync_table(conn, catalog_entry, state):
+            for message in sync_table(conn, catalog_entry, state,query):
                 yield message
 
     # If we get here, we've finished processing all the streams, so clear
@@ -475,9 +546,9 @@ def coerce_datetime(o):
     raise TypeError("Type {} is not serializable".format(type(o)))
 
 
-def do_sync(conn, db_name, db_schema, catalog, state):
+def do_sync(conn, db_name, db_schema, catalog, state,query=None):
     LOGGER.info("Starting Redshift sync")
-    for message in generate_messages(conn, db_name, db_schema, catalog, state):
+    for message in generate_messages(conn, db_name, db_schema, catalog, state,query):
         sys.stdout.write(json.dumps(message.asdict(),
                                     default=coerce_datetime,
                                     use_decimal=True) + '\n')
@@ -534,15 +605,30 @@ def build_state(raw_state, catalog):
 
     return state
 
+def get_query_catalog(catalog,query_name):
+    query_name = query_name.replace(" ","-")
+    for stream in catalog.get("streams"):
+        if stream.get("stream") == query_name:
+            return stream
 
 def main_impl():
     args = utils.parse_args(REQUIRED_CONFIG_KEYS)
     CONFIG.update(args.config)
+    queries = args.config.get("queries", None)
     connection = open_connection(args.config)
     db_schema = args.config.get('schema', 'public')
     db_name = args.config.get('dbname', 'dev')
     if args.discover:
-        do_discover(connection, db_name, db_schema)
+        do_discover(connection, db_name, db_schema,queries)
+    elif queries:
+        for query in queries:
+            catalog = get_query_catalog(args.properties,query.get("name"))
+            if catalog:
+                # Use the created catalog for synchronization
+                selected_catalog = Catalog.from_dict({"streams":[catalog]})
+                state = build_state(args.state, selected_catalog)
+                #Process query
+                do_sync(connection, db_name, db_schema, selected_catalog, state,query)   
     elif args.catalog:
         state = build_state(args.state, args.catalog)
         do_sync(connection, db_name, db_schema, args.catalog, state)
