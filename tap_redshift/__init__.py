@@ -116,15 +116,21 @@ def queries_catalog(conn,database_name,queries):
         query_name = query.get("name").replace(" ","-")
         cols = []
         column_schemas = {}
+        replication_key = None
+        if "replication_key" in query:
+            replication_key = query['replication_key']
         for column in columns_list:
+            col_type = "varchar"
+            if replication_key == column:
+                col_type = "timestamp"
             #All query columns for now will be string and nullable type
             column_schema_dict = {
-                "type":"varchar",
+                "type":f"{col_type}",
                 "nullable":"YES",
             }
             cols.append({
                 "name":column,
-                "type":"varchar",
+                "type":f"{col_type}",
                 "nullable":"YES",
             })
             column_schemas[column] =  schema_for_column(column_schema_dict)
@@ -322,6 +328,12 @@ def create_column_metadata(
             'replication-method': 'FULL_TABLE',
             'reason': 'No replication keys found from table'})
 
+    #Assign replication column
+    if len(valid_rep_keys)>0:
+        mdata = metadata.write(mdata, (), 'replication-key', valid_rep_keys[0])
+        mdata = metadata.write(mdata, (), 'replication-method', "INCREMENTAL")
+
+
     return metadata.to_list(mdata)
 
 
@@ -441,11 +453,17 @@ def sync_table(connection, catalog_entry, state,query=None):
                 'replication_key_value'
             ) or formatted_start_date.isoformat()
 
+        #Override select with query from the config. 
+        if query:
+            select = query.get("query")    
+
         if replication_key_value is not None:
             entry_schema = catalog_entry.schema
 
             if entry_schema.properties[replication_key].format == 'date-time':
                 replication_key_value = pendulum.parse(replication_key_value)
+                if isinstance(replication_key_value,datetime.datetime):
+                    replication_key_value = replication_key_value.isoformat()
 
             select += ' WHERE {} >= %(replication_key_value)s ORDER BY {} ' \
                       'ASC'.format(replication_key, replication_key)
@@ -455,9 +473,6 @@ def sync_table(connection, catalog_entry, state,query=None):
             select += ' ORDER BY {} ASC'.format(replication_key)
 
         time_extracted = utils.now()
-        #Override select with query from the config. 
-        if query:
-            select = query.get("query")
         query_string = cursor.mogrify(select, params)
         LOGGER.info('Running {}'.format(query_string))
 
