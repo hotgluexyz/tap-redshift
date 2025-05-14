@@ -26,6 +26,7 @@ import pendulum
 import datetime
 import sys
 import simplejson as json
+from dateutil import parser
 
 import psycopg2
 import singer
@@ -420,11 +421,7 @@ def sync_table(connection, catalog_entry, state,query=None):
         params = {}
 
         if start_date is not None:
-            try:
-                formatted_start_date = datetime.datetime.strptime(start_date, '%Y-%m-%dT%H:%M:%S.%fZ').astimezone()
-            except ValueError:
-                # Try without microseconds if the previous format fails
-                formatted_start_date = datetime.datetime.strptime(start_date, '%Y-%m-%dT%H:%M:%SZ').astimezone()
+            formatted_start_date = parser.parse(start_date).astimezone()
 
         replication_key = metadata.to_map(catalog_entry.metadata).get(
             (), {}).get('replication-key')
